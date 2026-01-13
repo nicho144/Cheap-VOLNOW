@@ -1,107 +1,147 @@
+# vrp_platform.py  –  all-in-one financial vol risk premium engine
+# ---------------------------------------------------------------
+# pip install yfinance aiohttp pandas numpy scipy pyarrow fastapi uvicorn exchange-calendars schedule
+# ---------------------------------------------------------------
+from __future__ import annotations
+import asyncio, aiohttp, yfinance as yf, pandas as pd, numpy as np, os, json, logging
+from datetime import datetime, timedelta
+from typing import Dict, List
+from pathlib import Path
+import exchange_calendars as xc
+from scipy import linalg
+from fastapi import FastAPI
+import schedule, time, sys
 
-           import streamlit as st
-import yfinance as yf
-import pandas as pd
-import numpy as np
-from datetime import datetime
+# ---------- config ----------
+TICKERS = dict(SPY="SPY", GOLD="GLD", YIELD="ZN=F")  # 10-yr T-note future
+CBOE_VOL_MAP = dict(SPY="VIX", GLD="GVZ", SLV="VXSLV", OIL="OVX", EUR="EVZ", GBP="BPVIX")
+DATA_DIR = Path("data")
+PARQUET_FILE = DATA_DIR / "vrp_store.parquet"
+CHEAP_PC = 0.15  # bottom 15 % == cheap
+os.makedirs(DATA_DIR, exist_ok=True)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
+NY = xc.get_calendar("NYSE")
+# ----------------------------
 
-# --- BACKEND: Data Logic ---
+# ---------- fetch ----------
+async def _fetch(url: str) -> dict:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as s:
+        async with s.get(url) as r:
+            r.raise_for_status()
+            return await r.json()
 
-def get_clean_data(ticker, period="60d"):
-    """Fetch data and force single-level columns to avoid MultiIndex errors."""
-    df = yf.download(ticker, period=period, interval="1d", multi_level_index=False)
-    if df.empty:
-        return pd.Series(dtype=float)
-    # Ensure it's a Series and not a 1-column DataFrame
-    return df['Close'].squeeze()
+async def last_close(symbol: str) -> float:
+    tk = yf.Ticker(symbol)
+    return float(tk.history(period="5d").Close.iloc[-1])
 
-def get_vrp_data(asset_ticker, vol_ticker):
-    """Calculates VRP: Difference between Implied and Realized Vol."""
-    price_series = get_clean_data(asset_ticker)
-    iv_series = get_clean_data(vol_ticker)
-    
-    if price_series.empty or iv_series.empty:
-        return pd.DataFrame()
+async def cboe_iv(sym: str) -> float:
+    url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/_X{sym}.json"
+    data = await _fetch(url)
+    return float(data["data"]["current_price"])
 
-    # Calculate 21-day Annualized Realized Volatility
-    log_return = np.log(price_series / price_series.shift(1))
-    rv = log_return.rolling(window=21).std() * np.sqrt(252) * 100
-    
-    # Align IV and RV into a single DataFrame
-    combined = pd.DataFrame({
-        'Realized Vol (21d)': rv,
-        'Implied Vol (Market)': iv_series
-    }).dropna()
-    
-    combined['VRP'] = combined['Implied Vol (Market)'] - combined['Realized Vol (21d)']
-    return combined
+async def realised_vol(symbol: str, days: int = 21) -> float:
+    tk = yf.Ticker(symbol)
+    px = tk.history(period=f"{int(days*1.5)}d").Close
+    rt = np.log(px / px.shift(1)).dropna()
+    return float(rt.std() * np.sqrt(252) * 100)
 
-def screen_cheap_iv(tickers):
-    """Screens for tickers where IV < RV (Potential Naked Buys)."""
-    results = []
-    for t in tickers:
-        try:
-            # Get Price and calc RV
-            price_series = get_clean_data(t, period="30d")
-            if price_series.empty: continue
-            rv = (np.log(price_series / price_series.shift(1)).std() * np.sqrt(252) * 100)
-            
-            # Get Options Chain (using first available expiry)
-            ticker_obj = yf.Ticker(t)
-            expiries = ticker_obj.options
-            if not expiries: continue
-            
-            chain = ticker_obj.option_chain(expiries[0])
-            current_price = price_series.iloc[-1]
-            
-            # Find At-The-Money (ATM) Call IV
-            atm_call = chain.calls.iloc[(chain.calls['strike'] - current_price).abs().argsort()[:1]]
-            iv = atm_call['impliedVolatility'].values[0] * 100
-            
-            results.append({
-                "Ticker": t,
-                "Price": round(current_price, 2),
-                "IV %": round(iv, 2),
-                "RV %": round(rv, 2),
-                "VRP": round(iv - rv, 2),
-                "Signal": "🟢 CHEAP" if iv < rv else "🔴 EXPENSIVE"
-            })
-        except Exception:
-            continue
-    return pd.DataFrame(results)
+# ---------- metrics ----------
+def har_rv(rv_series: pd.Series) -> float:
+    df = pd.DataFrame({"rv": rv_series})
+    df["rv1"] = df.rv.shift(1)
+    df["rv5"] = df.rv.rolling(5).mean().shift(1)
+    df["rv22"] = df.rv.rolling(22).mean().shift(1)
+    df = df.dropna()
+    if len(df) < 10:
+        return float(df.rv.mean())  # fallback
+    y, X = df.rv, df[["rv1", "rv5", "rv22"]]
+    β, *_ = linalg.lstsq(X, y)
+    forecast = β @ np.array([df.rv1.iloc[-1], df.rv5.iloc[-1], df.rv22.iloc[-1]])
+    return float(forecast)
 
-# --- FRONTEND: Dashboard ---
+def vrp(iv: float, rv_expected: float) -> float:
+    return iv - rv_expected
 
-st.set_page_config(page_title="VRP Terminal 2026", layout="wide")
-st.title("📊 Cross-Asset Volatility Risk Premium")
-st.caption("Daily VRP Dashboard: SPY, Gold, and 10Y Yields")
+# ---------- scanner ----------
+async def _iv_range(cboe_sym: str) -> dict:
+    url = f"https://cdn.cboe.com/api/global/delayed_quotes/historical_data/_X{cboe_sym}.json"
+    js = await _fetch(url)
+    series = pd.Series({pd.to_datetime(d["date"]): float(d["close"]) for d in js["data"]})
+    latest, low, high = series.iloc[-1], series.min(), series.max()
+    return dict(symbol=cboe_sym, latest=latest, low=low, high=high,
+                pct=(latest - low) / (high - low))
 
-# 1. Main Dashboard Gauges
-col1, col2, col3 = st.columns(3)
-assets = {"SPY": "^VIX", "GLD": "^GVZ", "10Y Yields (^TNX)": "^TYVIX"}
+async def scan_cheap_vol() -> pd.DataFrame:
+    tasks = [asyncio.create_task(_iv_range(s)) for s in CBOE_VOL_MAP.values()]
+    rows = await asyncio.gather(*tasks)
+    df = pd.DataFrame(rows)
+    cheap = df[df["pct"] <= CHEAP_PC]
+    return cheap.sort_values("pct")
 
-for i, (asset, vol_idx) in enumerate(assets.items()):
-    with [col1, col2, col3][i]:
-        df = get_vrp_data(asset.split(" ")[0], vol_idx)
-        if not df.empty:
-            latest_vrp = df['VRP'].iloc[-1]
-            status = "Bearish (Overpriced)" if latest_vrp > 0 else "Bullish (Underpriced)"
-            st.metric(asset, f"{latest_vrp:.2f}", delta=status, delta_color="inverse")
-            st.line_chart(df[['Realized Vol (21d)', 'Implied Vol (Market)']])
-        else:
-            st.error(f"Data unavailable for {asset}")
+# ---------- API ----------
+app = FastAPI(title="VRP-Platform")
 
-# 2. Options Screener
-st.markdown("---")
-st.subheader("🎯 Cheap IV Screener: Naked Buy Opportunities")
-st.write("Calculates ATM IV vs 30-day Realized Vol. Negative VRP suggests options are underpriced relative to movement.")
+@app.get("/vrp/{asset}")
+async def vrp_endpoint(asset: str):
+    asset = asset.upper()
+    if asset not in TICKERS:
+        return {"error": "asset must be SPY, GOLD or YIELD"}
+    sym = TICKERS[asset]
+    iv, rv = await asyncio.gather(
+        cboe_iv(CBOE_VOL_MAP.get(sym, "VIX")),
+        realised_vol(sym),
+    )
+    tk = yf.Ticker(sym)
+    rv_series = tk.history(period="6mo").Close.pct_change().rolling(21).std() * np.sqrt(252) * 100
+    har = har_rv(rv_series.dropna())
+    return {
+        "asset": asset,
+        "iv": round(iv, 2),
+        "rv_21d": round(rv, 2),
+        "rv_har": round(har, 2),
+        "vrp_classic": round(vrp(iv, rv), 2),
+        "vrp_har": round(vrp(iv, har), 2),
+    }
 
-watchlist = ["AAPL", "TSLA", "NVDA", "AMD", "MSFT", "GOOGL", "AMZN", "META", "COIN", "MARA"]
-if st.button("🚀 Run Options Screen"):
-    with st.spinner("Calculating Volatility Ratios..."):
-        screen_df = screen_cheap_iv(watchlist)
-        if not screen_df.empty:
-            # Highlight cheap rows
-            st.dataframe(screen_df.sort_values("VRP"), use_container_width=True)
-        else:
-            st.warning("No option data found for watchlist.")
+@app.get("/cheap_vol")
+async def cheap_vol():
+    return (await scan_cheap_vol()).to_dict(orient="records")
+
+# ---------- scheduler ----------
+async def snapshot_job():
+    records = []
+    for asset, sym in TICKERS.items():
+        iv, rv = await asyncio.gather(cboe_iv(CBOE_VOL_MAP.get(sym, "VIX")), realised_vol(sym))
+        tk = yf.Ticker(sym)
+        rv_series = tk.history(period="6mo").Close.pct_change().rolling(21).std() * np.sqrt(252) * 100
+        har = har_rv(rv_series.dropna())
+        records.append({
+            "ts": datetime.utcnow(),
+            "asset": asset,
+            "iv": iv,
+            "rv": rv,
+            "rv_har": har,
+            "vrp": vrp(iv, har),
+        })
+    df = pd.DataFrame(records)
+    if PARQUET_FILE.exists():
+        old = pd.read_parquet(PARQUET_FILE)
+        df = pd.concat([old, df], ignore_index=True)
+    df.to_parquet(PARQUET_FILE, engine="pyarrow")
+    logging.info("VRP snapshot saved (%s)", df.iloc[-1]["ts"])
+
+def run_scheduler():
+    schedule.every().day.at("16:30").do(lambda: asyncio.run(snapshot_job()))
+    logging.info("Scheduler started – next snapshot at 16:30 ET")
+    while True:
+        schedule.run_pending()
+        time.sleep(30)
+
+# ---------- entry ----------
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "api":
+        # launch:  python vrp_platform.py api
+        import uvicorn
+        uvicorn.run(app, host="0.0.0.0", port=8000)
+    else:
+        run_scheduler()
