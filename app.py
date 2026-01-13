@@ -1,147 +1,114 @@
-# vrp_platform.py  –  all-in-one financial vol risk premium engine
-# ---------------------------------------------------------------
-# pip install yfinance aiohttp pandas numpy scipy pyarrow fastapi uvicorn exchange-calendars schedule
-# ---------------------------------------------------------------
-from __future__ import annotations
-import asyncio, aiohttp, yfinance as yf, pandas as pd, numpy as np, os, json, logging
+# app.py – Streamlit-only Vol-Risk-Premium & Cheap-Vol scanner
+# -----------------------------------------------------------
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
 from datetime import datetime, timedelta
-from typing import Dict, List
-from pathlib import Path
-import exchange_calendars as xc
-from scipy import linalg
-from fastapi import FastAPI
-import schedule, time, sys
+import ssl, os, sys
+
+# ---------- Streamlit Cloud SSL fix (aiohttp not needed) ----------
+ssl._create_default_https_context = ssl._create_unverified_context
 
 # ---------- config ----------
-TICKERS = dict(SPY="SPY", GOLD="GLD", YIELD="ZN=F")  # 10-yr T-note future
-CBOE_VOL_MAP = dict(SPY="VIX", GLD="GVZ", SLV="VXSLV", OIL="OVX", EUR="EVZ", GBP="BPVIX")
-DATA_DIR = Path("data")
-PARQUET_FILE = DATA_DIR / "vrp_store.parquet"
-CHEAP_PC = 0.15  # bottom 15 % == cheap
-os.makedirs(DATA_DIR, exist_ok=True)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
-NY = xc.get_calendar("NYSE")
-# ----------------------------
+TICKERS = {"SPY": "SPY", "GOLD": "GLD", "YIELD": "TLT"}  # TLT ≈ 10-yr
+STOCK_CACHE = "stock_cache.parquet"
+OPT_CACHE   = "opt_cache.parquet"
+CACHE_MINS  = 30
 
-# ---------- fetch ----------
-async def _fetch(url: str) -> dict:
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as s:
-        async with s.get(url) as r:
-            r.raise_for_status()
-            return await r.json()
 
-async def last_close(symbol: str) -> float:
-    tk = yf.Ticker(symbol)
-    return float(tk.history(period="5d").Close.iloc[-1])
+# ---------- helpers ----------
+@st.cache_data(ttl=60*CACHE_MINS)
+def load_history(ticker: str, period: str = "6mo"):
+    """Return daily price series with Date index."""
+    return yf.download(ticker, period=period, progress=False)["Adj Close"]
 
-async def cboe_iv(sym: str) -> float:
-    url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/_X{sym}.json"
-    data = await _fetch(url)
-    return float(data["data"]["current_price"])
+@st.cache_data(ttl=60*CACHE_MINS)
+def get_options_iv(ticker: str) -> float:
+    """
+    Quick 30-day IV proxy: average of closest two expiries ATM implied vol.
+    Falls back to 20-day realised if options unavailable.
+    """
+    tk = yf.Ticker(ticker)
+    try:
+        opts = tk.options
+        if not opts:
+            raise RuntimeError("No options chain")
+        exp1, exp2 = opts[0], opts[1]
+        chain1 = tk.option_chain(exp1).calls
+        chain2 = tk.option_chain(exp2).calls
+        atm1 = chain1.iloc[(chain1.strike - chain1.lastPrice).abs().argsort()[:1]]
+        atm2 = chain2.iloc[(chain2.strike - chain2.lastPrice).abs().argsort()[:1]]
+        # crude linear interp to 30 days
+        d1 = (pd.to_datetime(exp1) - datetime.now()).days
+        d2 = (pd.to_datetime(exp2) - datetime.now()).days
+        iv1, iv2 = atm1.impliedVolatility.iloc[0], atm2.impliedVolatility.iloc[0]
+        iv30 = np.interp(30, [d1, d2], [iv1, iv2]) * 100
+        return float(iv30)
+    except Exception as e:
+        # fallback: 20-day realised
+        px = load_history(ticker, "40d")
+        rt = np.log(px / px.shift(1)).dropna()
+        return float(rt.std() * np.sqrt(252) * 100)
 
-async def realised_vol(symbol: str, days: int = 21) -> float:
-    tk = yf.Ticker(symbol)
-    px = tk.history(period=f"{int(days*1.5)}d").Close
+def realised_vol(ticker: str, days: int = 21) -> float:
+    px = load_history(ticker, "6mo")
     rt = np.log(px / px.shift(1)).dropna()
-    return float(rt.std() * np.sqrt(252) * 100)
+    return float(rt.rolling(days).std().iloc[-1] * np.sqrt(252) * 100)
 
-# ---------- metrics ----------
-def har_rv(rv_series: pd.Series) -> float:
-    df = pd.DataFrame({"rv": rv_series})
-    df["rv1"] = df.rv.shift(1)
-    df["rv5"] = df.rv.rolling(5).mean().shift(1)
-    df["rv22"] = df.rv.rolling(22).mean().shift(1)
-    df = df.dropna()
-    if len(df) < 10:
-        return float(df.rv.mean())  # fallback
-    y, X = df.rv, df[["rv1", "rv5", "rv22"]]
-    β, *_ = linalg.lstsq(X, y)
-    forecast = β @ np.array([df.rv1.iloc[-1], df.rv5.iloc[-1], df.rv22.iloc[-1]])
-    return float(forecast)
+def cheap_vol_rank(ticker: str) -> float:
+    """1-yr percentile of 30-day IV (0 = cheapest, 1 = richest)."""
+    px = load_history(ticker, "1y")
+    # use 20-day RV as IV proxy history (no historic options)
+    rt = np.log(px / px.shift(1)).dropna()
+    rv_hist = rt.rolling(20).std() * np.sqrt(252) * 100
+    current_iv = get_options_iv(ticker)
+    return float((rv_hist <= current_iv).mean())
 
-def vrp(iv: float, rv_expected: float) -> float:
-    return iv - rv_expected
-
-# ---------- scanner ----------
-async def _iv_range(cboe_sym: str) -> dict:
-    url = f"https://cdn.cboe.com/api/global/delayed_quotes/historical_data/_X{cboe_sym}.json"
-    js = await _fetch(url)
-    series = pd.Series({pd.to_datetime(d["date"]): float(d["close"]) for d in js["data"]})
-    latest, low, high = series.iloc[-1], series.min(), series.max()
-    return dict(symbol=cboe_sym, latest=latest, low=low, high=high,
-                pct=(latest - low) / (high - low))
-
-async def scan_cheap_vol() -> pd.DataFrame:
-    tasks = [asyncio.create_task(_iv_range(s)) for s in CBOE_VOL_MAP.values()]
-    rows = await asyncio.gather(*tasks)
-    df = pd.DataFrame(rows)
-    cheap = df[df["pct"] <= CHEAP_PC]
-    return cheap.sort_values("pct")
-
-# ---------- API ----------
-app = FastAPI(title="VRP-Platform")
-
-@app.get("/vrp/{asset}")
-async def vrp_endpoint(asset: str):
-    asset = asset.upper()
-    if asset not in TICKERS:
-        return {"error": "asset must be SPY, GOLD or YIELD"}
-    sym = TICKERS[asset]
-    iv, rv = await asyncio.gather(
-        cboe_iv(CBOE_VOL_MAP.get(sym, "VIX")),
-        realised_vol(sym),
-    )
-    tk = yf.Ticker(sym)
-    rv_series = tk.history(period="6mo").Close.pct_change().rolling(21).std() * np.sqrt(252) * 100
-    har = har_rv(rv_series.dropna())
-    return {
-        "asset": asset,
-        "iv": round(iv, 2),
-        "rv_21d": round(rv, 2),
-        "rv_har": round(har, 2),
-        "vrp_classic": round(vrp(iv, rv), 2),
-        "vrp_har": round(vrp(iv, har), 2),
-    }
-
-@app.get("/cheap_vol")
-async def cheap_vol():
-    return (await scan_cheap_vol()).to_dict(orient="records")
-
-# ---------- scheduler ----------
-async def snapshot_job():
-    records = []
+# ---------- core ----------
+def build_vrp_table():
+    rows = []
     for asset, sym in TICKERS.items():
-        iv, rv = await asyncio.gather(cboe_iv(CBOE_VOL_MAP.get(sym, "VIX")), realised_vol(sym))
-        tk = yf.Ticker(sym)
-        rv_series = tk.history(period="6mo").Close.pct_change().rolling(21).std() * np.sqrt(252) * 100
-        har = har_rv(rv_series.dropna())
-        records.append({
-            "ts": datetime.utcnow(),
-            "asset": asset,
-            "iv": iv,
-            "rv": rv,
-            "rv_har": har,
-            "vrp": vrp(iv, har),
-        })
-    df = pd.DataFrame(records)
-    if PARQUET_FILE.exists():
-        old = pd.read_parquet(PARQUET_FILE)
-        df = pd.concat([old, df], ignore_index=True)
-    df.to_parquet(PARQUET_FILE, engine="pyarrow")
-    logging.info("VRP snapshot saved (%s)", df.iloc[-1]["ts"])
+        iv  = get_options_iv(sym)
+        rv  = realised_vol(sym, 21)
+        rows.append(
+            {
+                "Asset": asset,
+                "Ticker": sym,
+                "30d IV (%)": round(iv, 2),
+                "21d RV (%)": round(rv, 2),
+                "VRP (%)":    round(iv - rv, 2),
+            }
+        )
+    return pd.DataFrame(rows)
 
-def run_scheduler():
-    schedule.every().day.at("16:30").do(lambda: asyncio.run(snapshot_job()))
-    logging.info("Scheduler started – next snapshot at 16:30 ET")
-    while True:
-        schedule.run_pending()
-        time.sleep(30)
+def build_cheap_vol_table():
+    rows = []
+    for asset, sym in TICKERS.items():
+        pct = cheap_vol_rank(sym)
+        rows.append(
+            {
+                "Asset": asset,
+                "Ticker": sym,
+                "IV 1-yr percentile": round(pct * 100, 1),
+                "Cheap?": "✅" if pct <= 0.15 else "❌",
+            }
+        )
+    return pd.DataFrame(rows).sort_values("IV 1-yr percentile")
 
-# ---------- entry ----------
-if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "api":
-        # launch:  python vrp_platform.py api
-        import uvicorn
-        uvicorn.run(app, host="0.0.0.0", port=8000)
-    else:
-        run_scheduler()
+# ---------- UI ----------
+st.set_page_config(page_title="Cheap-Vol & VRP Monitor", layout="centered")
+st.title("Real-Time Volatility Risk Premium & Cheap-Vol Scanner")
+st.markdown("Data refreshed every 30 min via Yahoo Finance (no keys required).")
+
+with st.spinner("Fetching latest data..."):
+    vrp_df = build_vrp_table()
+    cheap_df = build_cheap_vol_table()
+
+st.subheader("Volatility Risk Premium (VRP)")
+st.dataframe(vrp_df, use_container_width=True)
+
+st.subheader("Cheap-Vol Ranking (lower percentile = cheaper)")
+st.dataframe(cheap_df, use_container_width=True)
+
+st.caption("Last updated: " + datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"))
