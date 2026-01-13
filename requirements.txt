@@ -1,16 +1,12 @@
-# Data Fetching & Core
+# Data Science & Market Data
 yfinance>=1.0.0
-pandas>=2.2.0
-numpy>=1.26.0
+pandas>=2.2.3
+numpy>=2.1.0
 
-# Dashboard & UI
-streamlit>=1.52.0
-plotly>=5.20.0
+# Frontend & Visualization
+streamlit>=1.41.0
+plotly>=5.24.0
 
-# Optional: Macro Data (FRED)
-fredapi>=0.5.1
-pandas-datareader>=0.10.0
-
-# Scraping & Reliability
-requests>=2.31.0
-beautifulsoup4>=4.12.0
+# Reliability Utilities
+requests>=2.32.0
+urllib3>=2.2.0

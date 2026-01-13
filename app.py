@@ -1,72 +1,107 @@
-import streamlit as st
+
+           import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
 
-# --- BACKEND: Data & Math ---
-def get_vrp_data(ticker_symbol, vol_index_symbol):
-    # Fetch Price Data for Realized Vol (RV)
-    data = yf.download(ticker_symbol, period="60d", interval="1d")
-    log_returns = np.log(data['Close'] / data['Close'].shift(1))
-    rv = log_returns.rolling(window=21).std() * np.sqrt(252) * 100
+# --- BACKEND: Data Logic ---
+
+def get_clean_data(ticker, period="60d"):
+    """Fetch data and force single-level columns to avoid MultiIndex errors."""
+    df = yf.download(ticker, period=period, interval="1d", multi_level_index=False)
+    if df.empty:
+        return pd.Series(dtype=float)
+    # Ensure it's a Series and not a 1-column DataFrame
+    return df['Close'].squeeze()
+
+def get_vrp_data(asset_ticker, vol_ticker):
+    """Calculates VRP: Difference between Implied and Realized Vol."""
+    price_series = get_clean_data(asset_ticker)
+    iv_series = get_clean_data(vol_ticker)
     
-    # Fetch Implied Vol (IV) Index Data
-    iv_data = yf.download(vol_index_symbol, period="60d", interval="1d")
+    if price_series.empty or iv_series.empty:
+        return pd.DataFrame()
+
+    # Calculate 21-day Annualized Realized Volatility
+    log_return = np.log(price_series / price_series.shift(1))
+    rv = log_return.rolling(window=21).std() * np.sqrt(252) * 100
     
-    df = pd.DataFrame({
+    # Align IV and RV into a single DataFrame
+    combined = pd.DataFrame({
         'Realized Vol (21d)': rv,
-        'Implied Vol (Market)': iv_data['Close']
+        'Implied Vol (Market)': iv_series
     }).dropna()
-    df['VRP'] = df['Implied Vol (Market)'] - df['Realized Vol (21d)']
-    return df
+    
+    combined['VRP'] = combined['Implied Vol (Market)'] - combined['Realized Vol (21d)']
+    return combined
 
-def screen_cheap_options(tickers):
+def screen_cheap_iv(tickers):
+    """Screens for tickers where IV < RV (Potential Naked Buys)."""
     results = []
     for t in tickers:
         try:
-            stock = yf.Ticker(t)
-            # Calculate 21-day RV
-            hist = stock.history(period="30d")
-            rv = hist['Close'].pct_change().std() * np.sqrt(252) * 100
+            # Get Price and calc RV
+            price_series = get_clean_data(t, period="30d")
+            if price_series.empty: continue
+            rv = (np.log(price_series / price_series.shift(1)).std() * np.sqrt(252) * 100)
             
-            # Get IV from ATM Option
-            expiries = stock.options
+            # Get Options Chain (using first available expiry)
+            ticker_obj = yf.Ticker(t)
+            expiries = ticker_obj.options
             if not expiries: continue
-            chain = stock.option_chain(expiries[0]) # Nearest expiry
-            # Filter for At-The-Money (ATM)
-            current_price = hist['Close'].iloc[-1]
-            atm_option = chain.calls.iloc[(chain.calls['strike'] - current_price).abs().argsort()[:1]]
-            iv = atm_option['impliedVolatility'].values[0] * 100
+            
+            chain = ticker_obj.option_chain(expiries[0])
+            current_price = price_series.iloc[-1]
+            
+            # Find At-The-Money (ATM) Call IV
+            atm_call = chain.calls.iloc[(chain.calls['strike'] - current_price).abs().argsort()[:1]]
+            iv = atm_call['impliedVolatility'].values[0] * 100
             
             results.append({
                 "Ticker": t,
+                "Price": round(current_price, 2),
                 "IV %": round(iv, 2),
                 "RV %": round(rv, 2),
-                "VRP (IV-RV)": round(iv - rv, 2),
-                "Status": "CHEAP (Buy)" if iv < rv else "EXPENSIVE (Sell)"
+                "VRP": round(iv - rv, 2),
+                "Signal": "🟢 CHEAP" if iv < rv else "🔴 EXPENSIVE"
             })
-        except: continue
+        except Exception:
+            continue
     return pd.DataFrame(results)
 
-# --- FRONTEND: Streamlit UI ---
-st.set_page_config(page_title="VRP Dashboard 2026", layout="wide")
-st.title("🛡️ Cross-Asset Volatility Risk Premium")
+# --- FRONTEND: Dashboard ---
 
+st.set_page_config(page_title="VRP Terminal 2026", layout="wide")
+st.title("📊 Cross-Asset Volatility Risk Premium")
+st.caption("Daily VRP Dashboard: SPY, Gold, and 10Y Yields")
+
+# 1. Main Dashboard Gauges
 col1, col2, col3 = st.columns(3)
+assets = {"SPY": "^VIX", "GLD": "^GVZ", "10Y Yields (^TNX)": "^TYVIX"}
 
-# Display VRP Gauges
-assets = {"SPY": "^VIX", "Gold (GLD)": "^GVZ", "10Y Yields": "^TYVIX"}
-for i, (name, vol_ticker) in enumerate(assets.items()):
-    df = get_vrp_data(name.split(" ")[0], vol_ticker)
-    latest = df.iloc[-1]
+for i, (asset, vol_idx) in enumerate(assets.items()):
     with [col1, col2, col3][i]:
-        st.metric(name, f"{latest['VRP']:.2f}", delta="Bearish (High VRP)" if latest['VRP'] > 0 else "Bullish (Low VRP)")
-        st.line_chart(df[['Realized Vol (21d)', 'Implied Vol (Market)']])
+        df = get_vrp_data(asset.split(" ")[0], vol_idx)
+        if not df.empty:
+            latest_vrp = df['VRP'].iloc[-1]
+            status = "Bearish (Overpriced)" if latest_vrp > 0 else "Bullish (Underpriced)"
+            st.metric(asset, f"{latest_vrp:.2f}", delta=status, delta_color="inverse")
+            st.line_chart(df[['Realized Vol (21d)', 'Implied Vol (Market)']])
+        else:
+            st.error(f"Data unavailable for {asset}")
 
+# 2. Options Screener
 st.markdown("---")
-st.subheader("🔍 Cheap IV Screener (Potential Naked Buys)")
-watchlist = ["AAPL", "TSLA", "NVDA", "AMD", "MSFT", "GOOGL", "AMZN", "META"]
-if st.button("Run Screener"):
-    screening_df = screen_cheap_options(watchlist)
-    st.table(screening_df.sort_values("VRP (IV-RV)"))
+st.subheader("🎯 Cheap IV Screener: Naked Buy Opportunities")
+st.write("Calculates ATM IV vs 30-day Realized Vol. Negative VRP suggests options are underpriced relative to movement.")
+
+watchlist = ["AAPL", "TSLA", "NVDA", "AMD", "MSFT", "GOOGL", "AMZN", "META", "COIN", "MARA"]
+if st.button("🚀 Run Options Screen"):
+    with st.spinner("Calculating Volatility Ratios..."):
+        screen_df = screen_cheap_iv(watchlist)
+        if not screen_df.empty:
+            # Highlight cheap rows
+            st.dataframe(screen_df.sort_values("VRP"), use_container_width=True)
+        else:
+            st.warning("No option data found for watchlist.")
