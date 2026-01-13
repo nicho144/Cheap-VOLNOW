@@ -1,168 +1,72 @@
-# ==========================
-# cheap-volnow IV scanner
-# ==========================
-
+import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from datetime import datetime
-import os
-import time
+from datetime import datetime, timedelta
 
-# ================= CONFIG =================
-TICKERS = ["AAPL", "TSLA", "SPY", "NVDA"]  # Watchlist
-IV_CHEAP_THRESHOLD = 0.25                  # 25% → potentially cheap
-NEAR_ATM_DOLLAR = 10                        # ±$10 filter
-NEAR_ATM_PCT = 0.02                         # ±2% filter for high-priced stocks
-HISTORY_FILE = "iv_history.csv"            # CSV to store historical IV
-MAX_RETRIES = 5
-RETRY_DELAY = 10                            # seconds
+# --- BACKEND: Data & Math ---
+def get_vrp_data(ticker_symbol, vol_index_symbol):
+    # Fetch Price Data for Realized Vol (RV)
+    data = yf.download(ticker_symbol, period="60d", interval="1d")
+    log_returns = np.log(data['Close'] / data['Close'].shift(1))
+    rv = log_returns.rolling(window=21).std() * np.sqrt(252) * 100
+    
+    # Fetch Implied Vol (IV) Index Data
+    iv_data = yf.download(vol_index_symbol, period="60d", interval="1d")
+    
+    df = pd.DataFrame({
+        'Realized Vol (21d)': rv,
+        'Implied Vol (Market)': iv_data['Close']
+    }).dropna()
+    df['VRP'] = df['Implied Vol (Market)'] - df['Realized Vol (21d)']
+    return df
 
-sns.set_style("darkgrid")
-
-# ================= HELPERS =================
-
-def get_current_price(ticker):
-    """Get latest price reliably."""
-    try:
-        stock = yf.Ticker(ticker)
-        price = stock.info.get("regularMarketPrice") or stock.info.get("currentPrice")
-        if price is None:
-            price = stock.history(period="1d")["Close"][-1]
-        return round(price, 2)
-    except Exception as e:
-        print(f"[Price Error] {ticker}: {e}")
-        return None
-
-
-def get_near_atm_iv(ticker):
-    """Compute near-ATM average and median IV."""
-    try:
-        stock = yf.Ticker(ticker)
-        expirations = stock.options
-        if not expirations:
-            return None
-
-        nearest_exp = expirations[0]
-        chain = stock.option_chain(nearest_exp)
-        current_price = get_current_price(ticker)
-        if current_price is None:
-            return None
-
-        options = pd.concat([chain.calls, chain.puts])
-        near_atm = options[
-            (abs(options['strike'] - current_price) <= NEAR_ATM_DOLLAR) |
-            (abs(options['strike'] - current_price) <= current_price * NEAR_ATM_PCT)
-        ]
-
-        if near_atm.empty:
-            return None
-
-        avg_iv = near_atm['impliedVolatility'].mean()
-        median_iv = near_atm['impliedVolatility'].median()
-
-        return {
-            "ticker": ticker,
-            "current_price": current_price,
-            "nearest_exp": nearest_exp,
-            "avg_near_atm_iv": avg_iv,
-            "median_near_atm_iv": median_iv,
-            "iv_percent": f"{avg_iv:.1%}",
-            "is_cheap": avg_iv < IV_CHEAP_THRESHOLD,
-            "num_contracts": len(near_atm)
-        }
-
-    except Exception as e:
-        print(f"[IV Error] {ticker}: {e}")
-        return None
-
-
-def get_near_atm_iv_with_retry(ticker):
-    """Retry wrapper for rate limit or transient errors."""
-    for attempt in range(MAX_RETRIES):
-        try:
-            data = get_near_atm_iv(ticker)
-            if data:
-                return data
-            else:
-                print(f"[No Options] {ticker}")
-                return None
-        except Exception as e:
-            print(f"[Retry Error] {ticker} Attempt {attempt+1}/{MAX_RETRIES}: {e}")
-            time.sleep(RETRY_DELAY)
-    return None
-
-
-def plot_iv_smile(ticker, exp_date=None):
-    """Plot IV vs Strike (smile/skew)."""
-    try:
-        stock = yf.Ticker(ticker)
-        if not exp_date:
-            if not stock.options:
-                print(f"No options for {ticker}")
-                return
-            exp_date = stock.options[0]
-
-        chain = stock.option_chain(exp_date)
-        current_price = get_current_price(ticker)
-
-        plt.figure(figsize=(10, 6))
-        sns.scatterplot(data=chain.calls, x="strike", y="impliedVolatility", label="Calls", alpha=0.6, color="blue")
-        sns.scatterplot(data=chain.puts, x="strike", y="impliedVolatility", label="Puts", alpha=0.6, color="red")
-        plt.axvline(current_price, color="black", linestyle="--", label=f"Current Price ≈ ${current_price:.0f}")
-        plt.title(f"{ticker} IV Smile/Skew - Expiration: {exp_date}")
-        plt.xlabel("Strike Price")
-        plt.ylabel("Implied Volatility")
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
-
-    except Exception as e:
-        print(f"[Plot Error] {ticker}: {e}")
-
-
-def update_iv_history(results):
-    """Save today's IV scan to CSV for future IV rank calculation."""
-    today = datetime.now().strftime("%Y-%m-%d")
-    df_new = pd.DataFrame(results)
-    df_new["date"] = today
-
-    if os.path.exists(HISTORY_FILE):
-        df_old = pd.read_csv(HISTORY_FILE)
-        df = pd.concat([df_old, df_new], ignore_index=True)
-    else:
-        df = df_new
-
-    df.to_csv(HISTORY_FILE, index=False)
-    print(f"[History Updated] {HISTORY_FILE}")
-
-
-# ================= MAIN SCANNER =================
-
-def scan_watchlist():
-    print(f"\n=== IV Scan Report - {datetime.now().strftime('%Y-%m-%d %H:%M')} ===\n")
+def screen_cheap_options(tickers):
     results = []
+    for t in tickers:
+        try:
+            stock = yf.Ticker(t)
+            # Calculate 21-day RV
+            hist = stock.history(period="30d")
+            rv = hist['Close'].pct_change().std() * np.sqrt(252) * 100
+            
+            # Get IV from ATM Option
+            expiries = stock.options
+            if not expiries: continue
+            chain = stock.option_chain(expiries[0]) # Nearest expiry
+            # Filter for At-The-Money (ATM)
+            current_price = hist['Close'].iloc[-1]
+            atm_option = chain.calls.iloc[(chain.calls['strike'] - current_price).abs().argsort()[:1]]
+            iv = atm_option['impliedVolatility'].values[0] * 100
+            
+            results.append({
+                "Ticker": t,
+                "IV %": round(iv, 2),
+                "RV %": round(rv, 2),
+                "VRP (IV-RV)": round(iv - rv, 2),
+                "Status": "CHEAP (Buy)" if iv < rv else "EXPENSIVE (Sell)"
+            })
+        except: continue
+    return pd.DataFrame(results)
 
-    for ticker in TICKERS:
-        data = get_near_atm_iv_with_retry(ticker)
-        if data:
-            results.append(data)
-            status = "CHEAP!" if data["is_cheap"] else "Normal/High"
-            print(f"{ticker:6} | Price: ${data['current_price']:7.2f} | "
-                  f"Nearest Exp: {data['nearest_exp']} | "
-                  f"Avg IV: {data['iv_percent']:>6} → {status}")
-        else:
-            print(f"{ticker:6} → No data / no options")
+# --- FRONTEND: Streamlit UI ---
+st.set_page_config(page_title="VRP Dashboard 2026", layout="wide")
+st.title("🛡️ Cross-Asset Volatility Risk Premium")
 
-    if results:
-        update_iv_history(results)
+col1, col2, col3 = st.columns(3)
 
-    print("\nDone. Use plot_iv_smile('AAPL') to visualize any ticker.")
-    return results
+# Display VRP Gauges
+assets = {"SPY": "^VIX", "Gold (GLD)": "^GVZ", "10Y Yields": "^TYVIX"}
+for i, (name, vol_ticker) in enumerate(assets.items()):
+    df = get_vrp_data(name.split(" ")[0], vol_ticker)
+    latest = df.iloc[-1]
+    with [col1, col2, col3][i]:
+        st.metric(name, f"{latest['VRP']:.2f}", delta="Bearish (High VRP)" if latest['VRP'] > 0 else "Bullish (Low VRP)")
+        st.line_chart(df[['Realized Vol (21d)', 'Implied Vol (Market)']])
 
-
-# ================= RUN IT =================
-
-if __name__ == "__main__"
+st.markdown("---")
+st.subheader("🔍 Cheap IV Screener (Potential Naked Buys)")
+watchlist = ["AAPL", "TSLA", "NVDA", "AMD", "MSFT", "GOOGL", "AMZN", "META"]
+if st.button("Run Screener"):
+    screening_df = screen_cheap_options(watchlist)
+    st.table(screening_df.sort_values("VRP (IV-RV)"))
